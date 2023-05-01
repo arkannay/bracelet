@@ -17,6 +17,16 @@
 #include "kiss_fftr.h"
 #include "ws2812.pio.h"
 
+#include "btstack_run_loop.h"
+#include "btstack_event.h"
+#include "pico/cyw43_arch.h"
+#include "pico/btstack_cyw43.h"
+#include "pico/multicore.h"
+#include "hal_led.h"
+#include "btstack.h"
+#include "ble/gatt-service/nordic_spp_service_server.h"
+#include "mygatt.h"
+
 #define IS_RGBW false
 #define NUM_PIXELS 144
 
@@ -24,7 +34,7 @@
 #define WS2812_PIN PICO_DEFAULT_WS2812_PIN
 #else
 // default to pin 2 if the board doesn't have a default WS2812 pin defined
-#define WS2812_PIN 6
+#define WS2812_PIN 22
 #endif
 
 // set this to determine sample rate
@@ -37,7 +47,6 @@
 
 // Channel 0 is GPIO26
 #define CAPTURE_CHANNEL 2
-#define LED_PIN 25
 // BE CAREFUL: anything over about 9000 here will cause things
 // to silently break. The code will compile and upload, but due
 // to memory issues nothing will work properly
@@ -47,6 +56,44 @@ dma_channel_config cfg;
 uint dma_chan;
 float freqs[NSAMP];
 float max_volume = 0.1;
+static bool is_music_mode = false;
+static uint32_t rgb = 0x00000000;
+static hci_con_handle_t con_handle = HCI_CON_HANDLE_INVALID;
+static btstack_packet_callback_registration_t hci_event_callback_registration;
+const uint8_t adv_data[] = {
+    // Flags general discoverable, BR/EDR not supported
+    2,
+    BLUETOOTH_DATA_TYPE_FLAGS,
+    0x06,
+    // Name
+    6,
+    BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'A',
+    'I',
+    'L',
+    'E',
+    'D',
+    // UUID ...
+    17,
+    BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS,
+    0x9e,
+    0xca,
+    0xdc,
+    0x24,
+    0xe,
+    0xe5,
+    0xa9,
+    0xe0,
+    0x93,
+    0xf3,
+    0xa3,
+    0xb5,
+    0x1,
+    0x0,
+    0x40,
+    0x6e,
+};
+const uint8_t adv_data_len = sizeof(adv_data);
 
 void setup();
 void sample(uint8_t *capture_buf);
@@ -57,220 +104,6 @@ struct RGB
     int g;
     int b;
 };
-struct RGB prevRGB;
-#define NO_NOTES 56
-struct Note
-{
-    char note[3];
-    float frequency;
-};
-
-struct Note notes[NO_NOTES] = {{"C0", 16.35},
-                               {"D0", 18.35},
-                               {"E0", 20.6},
-                               {"F0", 21.83},
-                               {"G0", 24.50},
-                               {"A0", 27.50},
-                               {"B0", 30.87},
-                               {"C1", 32.70},
-                               {"D1", 36.71},
-                               {"E1", 41.20},
-                               {"F1", 43.65},
-                               {"G1", 49},
-                               {"A1", 55},
-                               {"B1", 61.74},
-                               {"C2", 65.41},
-                               {"D2", 73.42},
-                               {"E2", 82.41},
-                               {"F2", 87.31},
-                               {"G2", 98},
-                               {"A2", 110},
-                               {"B2", 123.47},
-                               {"C3", 130.81},
-                               {"D3", 146.83},
-                               {"G3", 196},
-                               {"B3", 246.94},
-                               {"D4", 293.66},
-                               {"F4", 349.23},
-                               {"G4", 392},
-                               {"A4", 440},
-                               {"B4", 493.88},
-                               {"C5", 523.25},
-                               {"D5", 587.33},
-                               {"E5", 659.25},
-                               {"F5", 698.46},
-                               {"G5", 783.99},
-                               {"A5", 880},
-                               {"B5", 987.77},
-                               {"C6", 1046.5},
-                               {"D6", 1174.66},
-                               {"E6", 1318.51},
-                               {"F6", 1396.91},
-                               {"G6", 1567.98},
-                               {"A6", 1760},
-                               {"B6", 1975.53},
-                               {"C7", 2093},
-                               {"D7", 2349.32},
-                               {"E7", 2637.02},
-                               {"F7", 2793.83},
-                               {"G7", 3135.96},
-                               {"A7", 3520},
-                               {"B7", 3951.07},
-                               {"C8", 4186.01},
-                               {"D8", 4698.63},
-                               {"E8", 5274.04},
-                               {"F8", 5587.65},
-                               {"G8", 6271.93},
-                               {"A8", 7040},
-                               {"B8", 7902.13}};
-
-struct Note closest_note(int freq)
-{
-    struct Note closestNote;
-    float minDistance = 999999;
-    float distance;
-    for (int i = 0; i < NO_NOTES; i++)
-    {
-        distance = abs(freq - notes[i].frequency);
-        if (distance < minDistance)
-        {
-            minDistance = distance;
-            closestNote = notes[i];
-        }
-    }
-    return closestNote;
-}
-struct RGB freq_to_rgb(int freq)
-{
-    if (freq < 10000)
-    {
-        freq = freq % 800;
-    }
-    struct RGB rgb;
-    rgb.r = 0;
-    rgb.g = 0;
-    rgb.b = 0;
-    if (freq >= 10000 || freq == 50)
-    {
-        return rgb;
-    }
-    if (freq < 40)
-    {
-        rgb.r = 255;
-        rgb.g = 0;
-        rgb.b = 0;
-    }
-    else if (freq >= 40 && freq <= 77)
-    {
-        int br = (freq - 40) * (255 / 37.0000);
-        rgb.r = 255;
-        rgb.g = 0;
-        rgb.b = br;
-    }
-    else if (freq > 77 && freq <= 205)
-    {
-        int r = 255 - ((freq - 78) * 2);
-        rgb.r = r;
-        rgb.g = 0;
-        rgb.b = 255;
-    }
-    else if (freq >= 206 && freq <= 238)
-    {
-        int g = (freq - 206) * (255 / 32.0000);
-        rgb.r = 0;
-        rgb.g = g;
-        rgb.b = 255;
-    }
-    else if (freq <= 239 && freq <= 250)
-    {
-        int r = (freq - 239) * (255 / 11.0000);
-        rgb.r = r;
-        rgb.g = 255;
-        rgb.b = 255;
-    }
-    else if (freq >= 251 && freq <= 270)
-    {
-        rgb.r = 255;
-        rgb.g = 255;
-        rgb.b = 255;
-    }
-    else if (freq >= 271 && freq <= 398)
-    {
-        int rb = 255 - ((freq - 271) * 2);
-        rgb.r = rb;
-        rgb.g = 255;
-        rgb.b = rb;
-    }
-    else if (freq >= 398 && freq <= 653)
-    {
-        rgb.r = 0;
-        rgb.g = 255 - (freq - 398);
-        rgb.b = (freq - 398);
-    }
-    else
-    {
-        rgb.r = 255;
-        rgb.g = 0;
-        rgb.b = 0;
-    }
-
-    return rgb;
-}
-
-struct RGB note_to_rgb(struct Note my_note)
-{
-    struct RGB rgb;
-    if (my_note.note[0] == 'A')
-    { // PURPLE
-        rgb.r = 173;
-        rgb.g = 99;
-        rgb.b = 218;
-    }
-    else if (my_note.note[0] == 'B')
-    { // BLUE
-        rgb.r = 0;
-        rgb.g = 0;
-        rgb.b = 255;
-    }
-    else if (my_note.note[0] == 'C')
-    { // ORANGE
-        rgb.r = 234;
-        rgb.g = 152;
-        rgb.b = 0;
-    }
-    else if (my_note.note[0] == 'D')
-    {
-        // GREY
-        rgb.r = 192;
-        rgb.g = 192;
-        rgb.b = 192;
-    }
-    else if (my_note.note[0] == 'E')
-    { // RED
-        rgb.r = 255;
-        rgb.g = 0;
-        rgb.b = 0;
-    }
-    else if (my_note.note[0] == 'F')
-    { // PINK
-        rgb.r = 244;
-        rgb.g = 181;
-        rgb.b = 224;
-    }
-    else if (my_note.note[0] == 'G')
-    { // GREEN
-        rgb.r = 0;
-        rgb.g = 255;
-        rgb.b = 0;
-    }
-    else
-    { // BLACK
-        rgb.r = 0;
-        rgb.g = 0;
-        rgb.b = 0;
-    }
-    return rgb;
-}
 
 static inline void put_pixel(uint32_t pixel_grb)
 {
@@ -326,6 +159,7 @@ void lightLEDS(struct RGB rgb, float percent_volume)
 
     prevRGB = rgb;
 }
+
 void setupLEDS()
 {
     PIO pio = pio0;
@@ -334,17 +168,144 @@ void setupLEDS()
     ws2812_program_init(pio, sm, offset, WS2812_PIN, 800000, IS_RGBW);
 }
 
-int main()
+static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
+    UNUSED(channel);
+    UNUSED(size);
+
+    if (packet_type != HCI_EVENT_PACKET)
+        return;
+
+    switch (hci_event_packet_get_type(packet))
+    {
+    case HCI_EVENT_DISCONNECTION_COMPLETE:
+        con_handle = HCI_CON_HANDLE_INVALID;
+        break;
+    default:
+        break;
+    }
+}
+
+static void nordic_spp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
+{   
+    UNUSED(channel);
+    struct RGB currRGB;
+    switch (packet_type)
+    {
+    case HCI_EVENT_PACKET:
+        if (hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META)
+            break;
+        switch (hci_event_gattservice_meta_get_subevent_code(packet))
+        {
+        case GATTSERVICE_SUBEVENT_SPP_SERVICE_CONNECTED:
+            con_handle = gattservice_subevent_spp_service_connected_get_con_handle(packet);
+            printf("Connected with handle 0x%04x\n", con_handle);
+            break;
+        case GATTSERVICE_SUBEVENT_SPP_SERVICE_DISCONNECTED:
+            con_handle = HCI_CON_HANDLE_INVALID;
+            break;
+        default:
+            break;
+        }
+        break;
+    case RFCOMM_DATA_PACKET:
+        switch (packet[0])
+        {
+        case 0x72:
+            rgb = 0x800000;
+            currRGB.r = 255;
+            currRGB.g = 0;
+            currRGB.b = 0;
+            is_music_mode = false;
+            break;
+        case 0x62:
+            rgb = 0x80000000;
+            currRGB.r = 0;
+            currRGB.g = 255;
+            currRGB.b = 0;
+            is_music_mode = false;
+            break;
+        case 0x67:
+            rgb = 0x008000;
+            currRGB.r = 0;
+            currRGB.g = 0;
+            currRGB.b = 255;
+            is_music_mode = false;
+            break;
+        case 0x01:
+            is_music_mode = !is_music_mode;
+            printf("music mode changed: %d\n", is_music_mode);
+            if (!is_music_mode) {            
+                currRGB.r = 0;
+                currRGB.g = 0;
+                currRGB.b = 0;
+                rgb = 0x000000;
+            }
+            break;
+        }
+            multicore_fifo_push_blocking((uint32_t) is_music_mode);
+            sleep_ms(100);
+            printf("Got new rgb: %#010x\n", rgb);
+            for (int i = 1; i <= NUM_PIXELS; i++)
+                put_pixel(urgb_u32_second(currRGB));
+        break;
+        //   pio_sm_put_blocking(pio0,0,rgb);
+
+    default:
+        break;
+    }
+}
+
+int setupBluetooth() {
+    printf("Setting up bluetooth");
+    if (cyw43_arch_init())
+    {
+        printf("failed to initialise cyw43_arch\n");
+        return -1;
+    }
+
+    hci_event_callback_registration.callback = &hci_packet_handler;
+    hci_add_event_handler(&hci_event_callback_registration);
+
+    l2cap_init();
+    sm_init();
+    att_server_init(profile_data, NULL, NULL);
+    nordic_spp_service_server_init(&nordic_spp_packet_handler);
+
+    uint16_t adv_int_min = 0x0030;
+    uint16_t adv_int_max = 0x0030;
+    uint8_t adv_type = 0;
+    bd_addr_t null_addr;
+    memset(null_addr, 0, 6);
+    gap_advertisements_set_params(adv_int_min, adv_int_max, adv_type, 0, null_addr, 0x07, 0x00);
+    gap_advertisements_set_data(adv_data_len, (uint8_t *)adv_data);
+    gap_advertisements_enable(1);
+
+    hci_power_control(HCI_POWER_ON);
+    return 0;
+}
+
+void core1_entry() {
     uint8_t cap_buf[NSAMP];
     kiss_fft_scalar fft_in[NSAMP]; // kiss_fft_scalar is a float
     kiss_fft_cpx fft_out[NSAMP];
     kiss_fftr_cfg cfg = kiss_fftr_alloc(NSAMP, false, 0, 0);
     int noComputings = 0;
-    // setup ports and outputs
-    setup();
+    uint32_t local_music_mode = (uint32_t) true;
+    uint32_t status;
     while (1)
-    {
+    {   
+        status = multicore_fifo_get_status();
+        if (multicore_fifo_get_status() == 11) {
+            multicore_fifo_pop_timeout_us(100, &status);
+            printf("new value from fifo: %d \n", status);
+            local_music_mode = status;
+        }
+        if (!local_music_mode) {
+            multicore_fifo_drain();
+            sleep_ms(1000);
+            continue;
+        }
         if (noComputings == 10)
         {
             noComputings = 0;
@@ -406,21 +367,21 @@ int main()
         {
             max_volume = max_power[0];
         }
-        float percent_volume;
-        if ((max_power[0] == max_volume && max_power[0] == 0) || max_power[0] == max_power[1])
-            percent_volume = 0;
-        else if (max_volume == 0)
-            percent_volume = 1;
-        else
-            percent_volume = max_power[0] / max_volume;
-        lightLEDS(note_to_rgb(closest_note(max_freq[0])), percent_volume);
-        printf("Greatest Frequency Component: %0.1f Hz; Volume: %0.1f; Max_Volume: %0.1f; Percent_Volume: %0.2f;\n", max_freq[0], max_power[0], max_volume, percent_volume);
-        printf("Closest notes: %s %s %s \n", closest_note(max_freq[0]).note, closest_note(max_freq[1]).note, closest_note(max_freq[2]).note);
+        lightLEDS(freq_to_rgb(max_freq[0]), 0.05);
+        printf("Greatest Frequency Component: %0.1f Hz;\n", max_freq[0]);
         noComputings++;
     }
 
     // should never get here
     kiss_fft_free(cfg);
+}
+
+int main()
+{
+    // setup ports and outputs
+    setup();
+    multicore_launch_core1(core1_entry);
+    btstack_run_loop_execute();
 }
 
 void sample(uint8_t *capture_buf)
@@ -435,18 +396,15 @@ void sample(uint8_t *capture_buf)
                           true           // start immediately
     );
 
-    gpio_put(LED_PIN, 1);
     adc_run(true);
     dma_channel_wait_for_finish_blocking(dma_chan);
-    gpio_put(LED_PIN, 0);
 }
 
 void setup()
 {
     stdio_init_all();
     setupLEDS();
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_IN);
+    setupBluetooth();
 
     adc_gpio_init(26 + CAPTURE_CHANNEL);
 
