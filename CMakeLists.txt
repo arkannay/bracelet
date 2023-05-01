@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
-
+set(PICO_BOARD "pico_w")# Pull in SDK (must be before project)
 # Pull in SDK (must be before project)
 include(pico_sdk_import.cmake)
 
@@ -40,11 +40,14 @@ add_compile_options(-Wall
 
         target_link_libraries(kiss_fftr pico_stdlib kiss_fft)
         
-        target_link_libraries(pio_ws2812 PRIVATE pico_stdlib hardware_pio hardware_adc hardware_dma hardware_pwm kiss_fftr)
+        target_link_libraries(pio_ws2812 PRIVATE pico_stdlib pico_btstack_ble pico_btstack_cyw43 pico_cyw43_arch_none pico_multicore hardware_pio hardware_adc hardware_dma hardware_pwm kiss_fftr)
+        target_include_directories(pio_ws2812 PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        )
         pico_enable_stdio_usb(pio_ws2812 1)
         pico_enable_stdio_uart(pio_ws2812 1)
         pico_add_extra_outputs(pio_ws2812)
-        
+        pico_btstack_make_gatt_header(pio_ws2812 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/mygatt.gatt")
         # add url via pico_set_program_url
         example_auto_set_url(pio_ws2812)
         
